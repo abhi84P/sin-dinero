@@ -1,0 +1,121 @@
+@page "/categories"
+@using Microsoft.AspNetCore.Authorization
+@attribute [Authorize]
+@rendermode InteractiveServer
+@inject ApplicationDbContext Db
+@inject AuthenticationStateProvider AuthProvider
+
+<PageTitle>Categories</PageTitle>
+
+<h1>Categories</h1>
+
+<p class="text-muted">Buckets to classify money in and out.</p>
+
+<EditForm Model="newCategory" OnValidSubmit="AddCategory" class="row g-2 align-items-end mb-4">
+    <DataAnnotationsValidator />
+    <div class="col-auto">
+        <label class="form-label">Name</label>
+        <InputText @bind-Value="newCategory.Name" class="form-control" />
+    </div>
+    <div class="col-auto">
+        <label class="form-label">Type</label>
+        <InputSelect @bind-Value="newCategory.Type" class="form-select">
+            <option value="@TransactionType.Expense">Expense</option>
+            <option value="@TransactionType.Income">Income</option>
+        </InputSelect>
+    </div>
+    <div class="col-auto">
+        <label class="form-label">Monthly limit</label>
+        <InputNumber @bind-Value="newCategory.MonthlyLimit" class="form-control" step="0.01" placeholder="none" />
+    </div>
+    <div class="col-auto">
+        <button type="submit" class="btn btn-primary">@(editing ? "Save" : "Add")</button>
+        @if (editing)
+        {
+            <button type="button" class="btn btn-secondary ms-1" @onclick="CancelEdit">Cancel</button>
+        }
+    </div>
+    <ValidationMessage For="() => newCategory.Name" />
+</EditForm>
+
+@if (categories is null)
+{
+    <p><em>Loading...</em></p>
+}
+else if (categories.Count == 0)
+{
+    <p>No categories yet. Add one above.</p>
+}
+else
+{
+    <table class="table">
+        <thead><tr><th>Name</th><th>Type</th><th class="text-end">Monthly limit</th><th></th></tr></thead>
+        <tbody>
+            @foreach (var c in categories)
+            {
+                <tr>
+                    <td>@c.Name</td>
+                    <td>@c.Type</td>
+                    <td class="text-end">@(c.MonthlyLimit?.ToString("C") ?? "—")</td>
+                    <td>
+                        <button class="btn btn-sm btn-outline-secondary" @onclick="() => StartEdit(c)">Edit</button>
+                        <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(c)">Delete</button>
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private List<Category>? categories;
+    private Category newCategory = new();
+    private string userId = string.Empty;
+    private bool editing => newCategory.Id != 0;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var state = await AuthProvider.GetAuthenticationStateAsync();
+        userId = state.User.FindFirstValue(ClaimTypes.NameIdentifier) ?? string.Empty;
+        await Load();
+    }
+
+    private async Task Load()
+    {
+        categories = await Db.Categories.AsNoTracking()
+            .Where(c => c.UserId == userId)
+            .OrderBy(c => c.Type).ThenBy(c => c.Name)
+            .ToListAsync();
+    }
+
+    private async Task AddCategory()
+    {
+        if (editing)
+        {
+            Db.Categories.Update(newCategory);
+        }
+        else
+        {
+            newCategory.UserId = userId;
+            Db.Categories.Add(newCategory);
+        }
+        await Db.SaveChangesAsync();
+        newCategory = new();
+        await Load();
+    }
+
+    private void StartEdit(Category c) =>
+        newCategory = new Category { Id = c.Id, Name = c.Name, Type = c.Type, MonthlyLimit = c.MonthlyLimit, UserId = c.UserId };
+
+    private void CancelEdit() => newCategory = new();
+
+    private async Task Delete(Category c)
+    {
+        // Restricted FK blocks delete if transactions reference it.
+        var hasTx = await Db.Transactions.AnyAsync(t => t.CategoryId == c.Id);
+        if (hasTx) return;
+        Db.Categories.Remove(c);
+        await Db.SaveChangesAsync();
+        await Load();
+    }
+}

@@ -1,0 +1,175 @@
+@page "/dashboard"
+@using Microsoft.AspNetCore.Authorization
+@attribute [Authorize]
+@rendermode InteractiveServer
+@inject ApplicationDbContext Db
+@inject SinDinero.Services.TransactionService TxService
+@inject AuthenticationStateProvider AuthProvider
+@inject IJSRuntime JS
+
+<PageTitle>Dashboard</PageTitle>
+
+<div class="d-flex align-items-center gap-2 mb-3">
+    <h1 class="mb-0 me-auto">Dashboard</h1>
+    <button class="btn btn-outline-secondary btn-sm" @onclick="PrevMonth">&laquo;</button>
+    <strong>@month.ToString("MMMM yyyy")</strong>
+    <button class="btn btn-outline-secondary btn-sm" @onclick="NextMonth">&raquo;</button>
+    <button class="btn btn-outline-primary btn-sm ms-2" @onclick="Rebuild" title="Recompute summaries from transactions">Rebuild</button>
+</div>
+
+@if (rows is null)
+{
+    <p><em>Loading...</em></p>
+}
+else
+{
+    <div class="row mb-4">
+        <div class="col"><div class="card text-bg-success"><div class="card-body"><h6>Income</h6><h3>@income.ToString("C")</h3></div></div></div>
+        <div class="col"><div class="card text-bg-danger"><div class="card-body"><h6>Expense</h6><h3>@expense.ToString("C")</h3></div></div></div>
+        <div class="col"><div class="card text-bg-secondary"><div class="card-body"><h6>Balance</h6><h3>@((income - expense).ToString("C"))</h3></div></div></div>
+    </div>
+
+    <div class="row">
+        <div class="col-md-6 mb-4">
+            <h5>Expense by category</h5>
+            @if (expenseRows.Count == 0)
+            {
+                <p class="text-muted">No expenses recorded for this month.</p>
+            }
+            else
+            {
+                <div style="max-width:420px"><canvas id="expenseChart"></canvas></div>
+            }
+        </div>
+
+        <div class="col-md-6 mb-4">
+            <h5>Budgets</h5>
+            @if (budgets.Count == 0)
+            {
+                <p class="text-muted">No category has a monthly limit. Set one on <a href="categories">Categories</a>.</p>
+            }
+            else
+            {
+                @foreach (var b in budgets)
+                {
+                    var pct = b.Limit == 0 ? 0 : (double)(b.Spent / b.Limit) * 100;
+                    var over = b.Spent > b.Limit;
+                    <div class="mb-2">
+                        <div class="d-flex justify-content-between">
+                            <span>@b.Name</span>
+                            <span class="@(over ? "text-danger fw-bold" : "")">@b.Spent.ToString("C") / @b.Limit.ToString("C")</span>
+                        </div>
+                        <div class="progress" role="progressbar">
+                            <div class="progress-bar @(over ? "bg-danger" : "bg-success")" style="width:@(Math.Min(pct, 100).ToString("0"))%"></div>
+                        </div>
+                    </div>
+                }
+            }
+        </div>
+    </div>
+
+    <h5>Last 6 months</h5>
+    <div style="max-width:720px"><canvas id="trendChart"></canvas></div>
+}
+
+@code {
+    private record Row(string Name, TransactionType Type, decimal Total);
+    private record Budget(string Name, decimal Spent, decimal Limit);
+    private record TrendPoint(string Label, decimal Income, decimal Expense);
+
+    private List<Row>? rows;
+    private List<Row> expenseRows = new();
+    private List<Budget> budgets = new();
+    private List<TrendPoint> trend = new();
+    private decimal income;
+    private decimal expense;
+    private string userId = string.Empty;
+    private DateOnly month = new(DateTime.Today.Year, DateTime.Today.Month, 1);
+    private bool renderCharts;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var state = await AuthProvider.GetAuthenticationStateAsync();
+        userId = state.User.FindFirstValue(ClaimTypes.NameIdentifier) ?? string.Empty;
+        await Load();
+    }
+
+    private async Task Load()
+    {
+        rows = await Db.MonthlySummaries.AsNoTracking()
+            .Where(s => s.UserId == userId && s.Year == month.Year && s.Month == month.Month)
+            .Select(s => new Row(s.Category!.Name, s.Category.Type, s.Total))
+            .ToListAsync();
+
+        income = rows.Where(r => r.Type == TransactionType.Income).Sum(r => r.Total);
+        expense = rows.Where(r => r.Type == TransactionType.Expense).Sum(r => r.Total);
+        expenseRows = rows.Where(r => r.Type == TransactionType.Expense && r.Total > 0)
+            .OrderByDescending(r => r.Total).ToList();
+
+        await LoadBudgets();
+        await LoadTrend();
+        renderCharts = true;
+    }
+
+    private async Task LoadBudgets()
+    {
+        // Expense categories that have a limit, joined with this month's spend.
+        var limited = await Db.Categories.AsNoTracking()
+            .Where(c => c.UserId == userId && c.Type == TransactionType.Expense && c.MonthlyLimit != null)
+            .Select(c => new { c.Id, c.Name, Limit = c.MonthlyLimit!.Value })
+            .ToListAsync();
+
+        var spendThisMonth = await Db.MonthlySummaries.AsNoTracking()
+            .Where(s => s.UserId == userId && s.Year == month.Year && s.Month == month.Month)
+            .ToDictionaryAsync(s => s.CategoryId, s => s.Total);
+
+        budgets = limited
+            .Select(c => new Budget(c.Name, spendThisMonth.GetValueOrDefault(c.Id), c.Limit))
+            .OrderByDescending(b => b.Limit == 0 ? 0 : b.Spent / b.Limit)
+            .ToList();
+    }
+
+    private async Task LoadTrend()
+    {
+        var start = month.AddMonths(-5);
+        // Pull the 6-month window once, aggregate in memory.
+        var data = await Db.MonthlySummaries.AsNoTracking()
+            .Where(s => s.UserId == userId &&
+                        (s.Year > start.Year || (s.Year == start.Year && s.Month >= start.Month)) &&
+                        (s.Year < month.Year || (s.Year == month.Year && s.Month <= month.Month)))
+            .Select(s => new { s.Year, s.Month, s.Category!.Type, s.Total })
+            .ToListAsync();
+
+        trend = new();
+        for (var m = start; m <= month; m = m.AddMonths(1))
+        {
+            var inc = data.Where(d => d.Year == m.Year && d.Month == m.Month && d.Type == TransactionType.Income).Sum(d => d.Total);
+            var exp = data.Where(d => d.Year == m.Year && d.Month == m.Month && d.Type == TransactionType.Expense).Sum(d => d.Total);
+            trend.Add(new TrendPoint(m.ToString("MMM yy"), inc, exp));
+        }
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!renderCharts) return;
+        renderCharts = false;
+
+        if (expenseRows.Count > 0)
+        {
+            await JS.InvokeVoidAsync("sinDineroCharts.renderDoughnut",
+                "expenseChart",
+                expenseRows.Select(r => r.Name).ToArray(),
+                expenseRows.Select(r => r.Total).ToArray());
+        }
+
+        await JS.InvokeVoidAsync("sinDineroCharts.renderTrend",
+            "trendChart",
+            trend.Select(t => t.Label).ToArray(),
+            trend.Select(t => t.Income).ToArray(),
+            trend.Select(t => t.Expense).ToArray());
+    }
+
+    private async Task PrevMonth() { month = month.AddMonths(-1); await Load(); }
+    private async Task NextMonth() { month = month.AddMonths(1); await Load(); }
+    private async Task Rebuild() { await TxService.RebuildAsync(userId); await Load(); }
+}

@@ -1,0 +1,168 @@
+@page "/transactions"
+@using Microsoft.AspNetCore.Authorization
+@attribute [Authorize]
+@rendermode InteractiveServer
+@inject ApplicationDbContext Db
+@inject SinDinero.Services.TransactionService TxService
+@inject AuthenticationStateProvider AuthProvider
+
+<PageTitle>Transactions</PageTitle>
+
+<h1>Transactions</h1>
+
+@if (categories is null)
+{
+    <p><em>Loading...</em></p>
+}
+else if (categories.Count == 0)
+{
+    <div class="alert alert-info">
+        Add a <a href="categories">category</a> first before recording transactions.
+    </div>
+}
+else
+{
+    <EditForm Model="newTx" OnValidSubmit="Save" class="row g-2 align-items-end mb-4">
+        <DataAnnotationsValidator />
+        <div class="col-auto">
+            <label class="form-label">Date</label>
+            <InputDate @bind-Value="newTx.Date" class="form-control" />
+        </div>
+        <div class="col-auto">
+            <label class="form-label">Category</label>
+            <InputSelect @bind-Value="newTx.CategoryId" class="form-select">
+                <option value="0" disabled>-- pick --</option>
+                @foreach (var c in categories)
+                {
+                    <option value="@c.Id">@c.Name (@c.Type)</option>
+                }
+            </InputSelect>
+        </div>
+        <div class="col-auto">
+            <label class="form-label">Amount</label>
+            <InputNumber @bind-Value="newTx.Amount" class="form-control" step="0.01" />
+        </div>
+        <div class="col-auto">
+            <label class="form-label">Note</label>
+            <InputText @bind-Value="newTx.Note" class="form-control" />
+        </div>
+        <div class="col-auto">
+            <button type="submit" class="btn btn-primary">@(editing ? "Save" : "Add")</button>
+            @if (editing)
+            {
+                <button type="button" class="btn btn-secondary ms-1" @onclick="CancelEdit">Cancel</button>
+            }
+        </div>
+        <ValidationSummary />
+    </EditForm>
+
+    <div class="mb-3">
+        <strong>Income:</strong> @income.ToString("C") &nbsp;|&nbsp;
+        <strong>Expense:</strong> @expense.ToString("C") &nbsp;|&nbsp;
+        <strong>Balance:</strong> @((income - expense).ToString("C"))
+    </div>
+
+    @if (transactions!.Count == 0)
+    {
+        <p>No transactions yet.</p>
+    }
+    else
+    {
+        <table class="table">
+            <thead><tr><th>Date</th><th>Category</th><th>Note</th><th class="text-end">Amount</th><th></th></tr></thead>
+            <tbody>
+                @foreach (var t in transactions)
+                {
+                    var sign = t.Category!.Type == TransactionType.Expense ? "-" : "+";
+                    <tr>
+                        <td>@t.Date.ToString("yyyy-MM-dd")</td>
+                        <td>@t.Category!.Name</td>
+                        <td>@t.Note</td>
+                        <td class="text-end">@sign@t.Amount.ToString("C")</td>
+                        <td>
+                            <button class="btn btn-sm btn-outline-secondary" @onclick="() => StartEdit(t)">Edit</button>
+                            <button class="btn btn-sm btn-outline-danger" @onclick="() => Delete(t)">Delete</button>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+}
+
+@code {
+    private List<Category>? categories;
+    private List<Transaction>? transactions;
+    private Transaction newTx = new();
+    private string userId = string.Empty;
+    private decimal income;
+    private decimal expense;
+
+    // Originals captured when editing, so the service can reverse the old delta.
+    private decimal origAmount;
+    private DateOnly origDate;
+    private int origCategoryId;
+
+    private bool editing => newTx.Id != 0;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var state = await AuthProvider.GetAuthenticationStateAsync();
+        userId = state.User.FindFirstValue(ClaimTypes.NameIdentifier) ?? string.Empty;
+        await Load();
+    }
+
+    private async Task Load()
+    {
+        categories = await Db.Categories.AsNoTracking()
+            .Where(c => c.UserId == userId)
+            .OrderBy(c => c.Name)
+            .ToListAsync();
+
+        transactions = await Db.Transactions.AsNoTracking()
+            .Include(t => t.Category)
+            .Where(t => t.UserId == userId)
+            .OrderByDescending(t => t.Date).ThenByDescending(t => t.Id)
+            .ToListAsync();
+
+        income = transactions.Where(t => t.Category!.Type == TransactionType.Income).Sum(t => t.Amount);
+        expense = transactions.Where(t => t.Category!.Type == TransactionType.Expense).Sum(t => t.Amount);
+    }
+
+    private async Task Save()
+    {
+        if (newTx.CategoryId == 0) return;
+        newTx.UserId = userId;
+        if (editing)
+            await TxService.UpdateAsync(newTx, origAmount, origDate, origCategoryId);
+        else
+            await TxService.AddAsync(newTx);
+        newTx = new();
+        await Load();
+    }
+
+    private void StartEdit(Transaction t)
+    {
+        newTx = new Transaction
+        {
+            Id = t.Id,
+            Amount = t.Amount,
+            Date = t.Date,
+            Note = t.Note,
+            CategoryId = t.CategoryId,
+            UserId = t.UserId
+        };
+        origAmount = t.Amount;
+        origDate = t.Date;
+        origCategoryId = t.CategoryId;
+    }
+
+    private void CancelEdit() => newTx = new();
+
+    private async Task Delete(Transaction t)
+    {
+        await TxService.DeleteAsync(t);
+        if (newTx.Id == t.Id) newTx = new();
+        await Load();
+    }
+}
